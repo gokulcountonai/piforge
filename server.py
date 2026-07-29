@@ -363,7 +363,17 @@ def list_devices():
         capture_output=True, text=True, check=True).stdout
     devs = []
     for d in json.loads(out).get("blockdevices", []):
-        if d.get("type") != "disk" or not d.get("rm"):
+        # Built-in SD/MMC card-reader slots routinely report RM=0 (a known
+        # kernel/driver quirk for SDHCI-based readers) even though the
+        # media itself is exactly as removable as a USB card reader's. A
+        # plain x86 laptop's real internal disk is always sda/nvme0n1,
+        # never mmcblkN, so trusting the name here doesn't weaken the
+        # "never offer a fixed disk" guarantee — and the mountpoint check
+        # below still excludes it outright if it's ever actually the
+        # running system's own disk (e.g. this code running on a Pi
+        # booted from its own SD card).
+        is_reader = bool(d.get("rm")) or d.get("name", "").startswith("mmcblk")
+        if d.get("type") != "disk" or not is_reader:
             continue
         if not d.get("size"):
             continue  # empty reader slot
