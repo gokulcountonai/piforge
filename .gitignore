@@ -2,6 +2,7 @@
 config.json
 profiles.json
 partition_profiles.json
+tailscale_config.json
 
 # Downloaded/decompressed OS images (multi-GB, machine-local cache)
 rpi-images/

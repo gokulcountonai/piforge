@@ -35,6 +35,7 @@ cp -p "${REPO_DIR}"/server.py \
       "${REPO_DIR}"/firstrun_gen.py \
       "${REPO_DIR}"/config.example.json \
       "${REPO_DIR}"/profiles.example.json \
+      "${REPO_DIR}"/tailscale_config.example.json \
       "${REPO_DIR}"/flash-all.sh \
       "${REPO_DIR}"/inject-config.sh \
       "${REPO_DIR}"/check-requirements.sh \
@@ -58,7 +59,7 @@ Section: utils
 Priority: optional
 Architecture: ${ARCH}
 Installed-Size: ${INSTALLED_SIZE_KB}
-Depends: python3, python3-gi, gir1.2-webkit2-4.1 | gir1.2-webkit2-4.0, util-linux, coreutils, xz-utils, openssl, wpasupplicant, parted, dosfstools, e2fsprogs, jq, curl, policykit-1
+Depends: python3, python3-gi, gir1.2-webkit2-4.1 | gir1.2-webkit2-4.0, util-linux, coreutils, xz-utils, openssl, wpasupplicant, parted, dosfstools, e2fsprogs, gnupg, jq, curl, policykit-1
 Maintainer: PiForge contributors <noreply@example.invalid>
 Homepage: https://github.com/
 Description: Mass SD card installer for Raspberry Pi OS

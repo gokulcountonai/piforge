@@ -190,6 +190,7 @@
   .tag.error { background: #FCE4E4; color: var(--bad); }
   .tag.cancelling, .tag.cancelled { background: var(--line); color: var(--muted); }
   .tag.partitioning, .tag.formatting { background: var(--red-tint); color: var(--red); }
+  .tag.tailscale { background: #E4F5E6; color: var(--go); }
 
   .stagebar { flex: none; display: flex; gap: 0.6rem; padding: 0.9rem 1.5rem 0; max-width: 1320px; margin: 0 auto; width: 100%; }
   .stagebtn {
@@ -306,6 +307,7 @@
 <div class="stagebar">
   <button type="button" class="stagebtn active" id="tab-flash">1 · Flash OS</button>
   <button type="button" class="stagebtn" id="tab-partition">2 · Partition cards</button>
+  <button type="button" class="stagebtn" id="tab-tailscale">3 · Tailscale</button>
 </div>
 
 <main>
@@ -455,6 +457,51 @@
       <div class="warnbox">This ERASES the entire partition table on every selected card — all data lost.</div>
     </section>
   </div>
+
+  <div class="mode-body" id="tailscale-mode" style="display:none">
+    <section class="panel">
+      <h2>Tailscale settings</h2>
+      <label>Mint endpoint URL</label>
+      <input type="text" id="ts_mint_endpoint" placeholder="http://&lt;server-tailscale-ip&gt;:9010/mint">
+      <div class="hint">Leave blank to mint directly against the Tailscale API using a local API key file instead — the mint server (if set) holds the real API credential so this station never sees it.</div>
+
+      <label style="margin-top:0.7rem">Local API key file (fallback when mint endpoint is blank)</label>
+      <input type="text" id="ts_apikey_file" placeholder="~/.config/tailscale-provision/apikey">
+
+      <div class="row" style="margin-top:0.7rem">
+        <div>
+          <label>Tailnet</label>
+          <input type="text" id="ts_tailnet" placeholder="-">
+        </div>
+        <div>
+          <label>Tag</label>
+          <input type="text" id="ts_tag" placeholder="tag:production">
+        </div>
+      </div>
+      <label style="margin-top:0.7rem">Key TTL (seconds)</label>
+      <input type="number" id="ts_key_ttl_seconds" min="60" step="60" value="86400">
+
+      <label style="margin-top:0.7rem">Ledger endpoint URL (optional)</label>
+      <input type="text" id="ts_ledger_endpoint" placeholder="http://&lt;server-tailscale-ip&gt;:9010/ledger">
+      <label>Ledger auth token (optional)</label>
+      <input type="password" id="ts_ledger_auth_token" placeholder="Bearer token">
+
+      <div class="btnrow" style="margin-top:0.9rem">
+        <button type="button" class="secondary" id="btn-ts-save">💾 Save settings</button>
+        <button type="button" class="secondary" id="btn-ts-ledger">📒 View ledger</button>
+      </div>
+      <div class="hint" style="margin-top:0.5rem">Station-wide — these settings apply to every card, not part of a saved profile.</div>
+    </section>
+
+    <section class="panel">
+      <h2>Join on first boot</h2>
+      <div class="check">
+        <input type="checkbox" id="tailscale_enabled">
+        <span>Mint a per-card Tailscale key and join the tailnet on first boot</span>
+      </div>
+      <div class="hint">Each card gets its own 24h, non-reusable, preauthorized key — GPG-encrypted onto the card under a per-card token, decrypted and used by a first-boot service that then deletes itself. Requires <code>gpg</code> on this station.</div>
+    </section>
+  </div>
   </div>
 
   <div class="col">
@@ -489,12 +536,24 @@ all selected cards are written in parallel</footer>
   </div>
 </div>
 
+<div class="modal-overlay" id="ts_ledger_modal" style="display:none">
+  <div class="modal">
+    <div class="modal-head">
+      <h3>📒 Tailscale ledger</h3>
+      <button type="button" class="modal-close" id="btn-ts-ledger-close">✕</button>
+    </div>
+    <div class="modal-body" id="ts_ledger_body">
+      <p class="hint">Last 50 keys issued.</p>
+    </div>
+  </div>
+</div>
+
 <script>
   const $ = id => document.getElementById(id);
   let devices = [], flashing = false, wasFlashing = false, misses = 0;
   const selected = new Set();
   const BUSY = ["queued", "downloading", "writing", "verifying", "configuring",
-                "partitioning", "formatting", "cancelling"];
+                "partitioning", "formatting", "tailscale", "cancelling"];
   const STORAGE_KEY = "piForgeConfig";
 
   const esc = s => String(s).replace(/[&<>"']/g, c =>
@@ -688,6 +747,7 @@ all selected cards are written in parallel</footer>
       image_url: currentImageUrl(),
       verify: $("verify").checked,
       notify_on_finish: $("notify_on_finish").checked,
+      tailscale_enabled: $("tailscale_enabled").checked,
     };
   }
 
@@ -731,6 +791,7 @@ all selected cards are written in parallel</footer>
     if (cfg.image_url) setImageUrl(cfg.image_url);
     $("verify").checked = !!cfg.verify;
     $("notify_on_finish").checked = !!cfg.notify_on_finish;
+    $("tailscale_enabled").checked = !!cfg.tailscale_enabled;
   }
 
   // Baseline is always config.json (via the server) so a fresh browser with
@@ -1022,12 +1083,15 @@ all selected cards are written in parallel</footer>
     mode = m;
     $("flash-mode").style.display = m === "flash" ? "" : "none";
     $("partition-mode").style.display = m === "partition" ? "" : "none";
+    $("tailscale-mode").style.display = m === "tailscale" ? "" : "none";
     $("tab-flash").classList.toggle("active", m === "flash");
     $("tab-partition").classList.toggle("active", m === "partition");
+    $("tab-tailscale").classList.toggle("active", m === "tailscale");
     updateButton();
   }
   $("tab-flash").addEventListener("click", () => setMode("flash"));
   $("tab-partition").addEventListener("click", () => setMode("partition"));
+  $("tab-tailscale").addEventListener("click", () => setMode("tailscale"));
 
   function pctSum() {
     return partitions.filter(p => p.size_mode === "percent")
@@ -1245,12 +1309,80 @@ all selected cards are written in parallel</footer>
     }
   });
 
+  // ---------------------------------------------------------- tailscale settings (stage 3)
+  function applyTailscaleConfig(tc) {
+    $("ts_mint_endpoint").value = tc.mint_endpoint ?? "";
+    $("ts_apikey_file").value = tc.ts_apikey_file ?? "";
+    $("ts_tailnet").value = tc.tailnet ?? "-";
+    $("ts_tag").value = tc.tag ?? "tag:production";
+    $("ts_key_ttl_seconds").value = tc.key_ttl_seconds ?? 86400;
+    $("ts_ledger_endpoint").value = tc.ledger_endpoint ?? "";
+    $("ts_ledger_auth_token").value = tc.ledger_auth_token ?? "";
+  }
+
+  async function loadTailscaleConfig() {
+    try {
+      applyTailscaleConfig(await (await fetch("/api/tailscale-config")).json());
+    } catch { /* server unreachable yet; poll() will surface the banner */ }
+  }
+
+  $("btn-ts-save").addEventListener("click", async () => {
+    const body = {
+      mint_endpoint: $("ts_mint_endpoint").value.trim(),
+      ts_apikey_file: $("ts_apikey_file").value.trim(),
+      tailnet: $("ts_tailnet").value.trim() || "-",
+      tag: $("ts_tag").value.trim() || "tag:production",
+      key_ttl_seconds: parseInt($("ts_key_ttl_seconds").value, 10) || 86400,
+      ledger_endpoint: $("ts_ledger_endpoint").value.trim(),
+      ledger_auth_token: $("ts_ledger_auth_token").value,
+    };
+    const res = await (await fetch("/api/tailscale-config", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })).json();
+    if (res.error) { alert("Error: " + res.error); return; }
+    const btn = $("btn-ts-save");
+    const original = btn.textContent;
+    btn.textContent = "✓ Saved";
+    setTimeout(() => { btn.textContent = original; }, 1600);
+  });
+
+  function openTsLedger() {
+    $("ts_ledger_modal").style.display = "flex";
+    $("ts_ledger_body").innerHTML = `<p class="hint">Loading…</p>`;
+    fetch("/api/tailscale-ledger").then(r => r.json()).then(({ rows }) => {
+      const body = $("ts_ledger_body");
+      if (!rows.length) {
+        body.innerHTML = `<p class="hint">No keys issued yet.</p>`;
+        return;
+      }
+      body.innerHTML = `<table class="history"><thead><tr>
+        <th>Time</th><th>Device</th><th>Hostname</th><th>Token</th><th>Key ID</th><th>Status</th>
+        </tr></thead><tbody>${rows.map(r => `<tr>
+          <td>${esc(r.timestamp || "")}</td>
+          <td>${esc(r.device || "")}</td>
+          <td>${esc(r.hostname || "")}</td>
+          <td>${esc(r.token_prefix || "")}…</td>
+          <td>${esc(r.key_id || "")}</td>
+          <td class="status-${esc(r.status || "")}">${esc((r.status || "").toUpperCase())}</td>
+        </tr>`).join("")}</tbody></table>`;
+    });
+  }
+  function closeTsLedger() { $("ts_ledger_modal").style.display = "none"; }
+  $("btn-ts-ledger").addEventListener("click", openTsLedger);
+  $("btn-ts-ledger-close").addEventListener("click", closeTsLedger);
+  $("ts_ledger_modal").addEventListener("click", e => { if (e.target.id === "ts_ledger_modal") closeTsLedger(); });
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape" && $("ts_ledger_modal").style.display !== "none") closeTsLedger();
+  });
+
   populateCountries();
   populateTimezones();
   populateKeymaps();
   populateImagePresets();
   loadDefaults();
   refreshProfiles();
+  loadTailscaleConfig();
   setInterval(poll, 2000);
   poll();
 </script>

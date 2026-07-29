@@ -11,6 +11,8 @@ static IP). Also serves named config profiles and a flash history log.
 Run:  sudo python3 server.py       then open http://127.0.0.1:47823
 """
 
+import base64
+import hashlib
 import json
 import os
 import re
@@ -72,6 +74,8 @@ CONFIG_PATH = resolve_data_path("config.json")
 CONFIG_EXAMPLE_PATH = os.path.join(BASE_DIR, "config.example.json")
 PROFILES_PATH = resolve_data_path("profiles.json")
 PARTITION_PROFILES_PATH = resolve_data_path("partition_profiles.json")
+TAILSCALE_CONFIG_PATH = resolve_data_path("tailscale_config.json")
+TAILSCALE_CONFIG_EXAMPLE_PATH = os.path.join(BASE_DIR, "tailscale_config.example.json")
 
 IMAGES_DIR = os.path.join(real_home(), "rpi-images")
 IMAGE_FILE = os.path.join(IMAGES_DIR, "os-image.img.xz")   # compressed download
@@ -79,6 +83,8 @@ RAW_IMAGE = os.path.join(IMAGES_DIR, "os-image.img")       # decompressed once
 URL_MARKER = os.path.join(IMAGES_DIR, "os-image.url")      # which URL is cached
 HISTORY_PATH = os.path.join(IMAGES_DIR, "flash-history.csv")
 HISTORY_FIELDS = ["timestamp", "device", "hostname", "status", "duration_s", "image_url"]
+TAILSCALE_LEDGER_PATH = os.path.join(IMAGES_DIR, "tailscale-ledger.csv")
+TAILSCALE_LEDGER_FIELDS = ["timestamp", "device", "hostname", "token_prefix", "key_id", "status"]
 DD_BS = "8M"
 
 # Generic, secret-free fallback used only if config.json is absent — the UI
@@ -104,6 +110,21 @@ BUILTIN_DEFAULTS = {
     "static_ip_dns": "",
     "static_ip_iface": "eth0",
     "notify_on_finish": False,
+    "tailscale_enabled": False,
+}
+
+# Station-wide Tailscale provisioning settings — not per-card, not part of a
+# flash profile. Mirrors flashing_station/.flash: either MINT_ENDPOINT (a
+# server holds the real Tailscale API credential and mints on request) or,
+# if blank, a local API key file read directly on this station.
+TAILSCALE_DEFAULTS = {
+    "mint_endpoint": "",
+    "ledger_endpoint": "",
+    "ledger_auth_token": "",
+    "ts_apikey_file": "",
+    "tailnet": "-",
+    "tag": "tag:production",
+    "key_ttl_seconds": 86400,
 }
 
 
@@ -125,6 +146,28 @@ def load_config_defaults():
 
 def current_image_url():
     return load_config_defaults().get("image_url") or DEFAULT_IMAGE_URL
+
+
+def load_tailscale_config():
+    """Same merge shape as load_config_defaults(): built-in defaults, then
+    an optional example file, then the real (gitignored) one."""
+    cfg = dict(TAILSCALE_DEFAULTS)
+    for path in (TAILSCALE_CONFIG_EXAMPLE_PATH, TAILSCALE_CONFIG_PATH):
+        try:
+            with open(path) as f:
+                cfg.update(json.load(f))
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+    return cfg
+
+
+def save_tailscale_config(cfg):
+    tmp = TAILSCALE_CONFIG_PATH + ".part"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, TAILSCALE_CONFIG_PATH)
 
 
 def load_profiles():
@@ -202,6 +245,31 @@ def read_history(limit=50):
         rows = list(csv.DictReader(f))
     return list(reversed(rows))[:limit]
 
+
+def log_tailscale_ledger(device, hostname, token_prefix, key_id, status):
+    os.makedirs(IMAGES_DIR, exist_ok=True)
+    is_new = not os.path.exists(TAILSCALE_LEDGER_PATH)
+    with open(TAILSCALE_LEDGER_PATH, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=TAILSCALE_LEDGER_FIELDS)
+        if is_new:
+            w.writeheader()
+        w.writerow({
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "device": device,
+            "hostname": hostname,
+            "token_prefix": token_prefix,
+            "key_id": key_id,
+            "status": status,
+        })
+
+
+def read_tailscale_ledger(limit=50):
+    if not os.path.exists(TAILSCALE_LEDGER_PATH):
+        return []
+    with open(TAILSCALE_LEDGER_PATH, newline="") as f:
+        rows = list(csv.DictReader(f))
+    return list(reversed(rows))[:limit]
+
 # ---------------------------------------------------------------- state
 
 JOBS = {}          # device -> {state, percent, message, hostname}
@@ -223,7 +291,7 @@ def set_job(dev, **kw):
 
 
 BUSY_STATES = {"queued", "downloading", "writing", "verifying", "configuring",
-                "partitioning", "formatting"}
+                "partitioning", "formatting", "tailscale"}
 
 
 def register_proc(dev, proc):
@@ -461,6 +529,13 @@ def boot_partition(dev):
     return None
 
 
+def root_partition(dev):
+    for suffix in ("2", "p2"):
+        if os.path.exists(dev + suffix):
+            return dev + suffix
+    return None
+
+
 class Cancelled(Exception):
     """Raised inside flash_device when the user cancelled this card."""
 
@@ -573,6 +648,26 @@ def flash_device(dev, cfg, hostname, static_ip=None):
         finally:
             subprocess.run(["umount", mnt], capture_output=True)
             os.rmdir(mnt)
+
+        if cfg.get("tailscale_enabled"):
+            check_cancelled(dev)
+            set_job(dev, state="tailscale", percent=100, message="Minting Tailscale key…")
+            root_part = root_partition(dev)
+            if not root_part:
+                raise RuntimeError("root partition not found for Tailscale provisioning")
+            subprocess.run(["umount", root_part], capture_output=True)
+            rmnt = tempfile.mkdtemp(prefix="rootfs-")
+            try:
+                subprocess.run(["mount", root_part, rmnt], check=True, capture_output=True)
+                tconf = load_tailscale_config()
+                key_id, token_prefix, _reader = install_tailscale_provisioning(dev, rmnt, tconf)
+                subprocess.run(["sync"])
+            finally:
+                subprocess.run(["umount", rmnt], capture_output=True)
+                os.rmdir(rmnt)
+            log_tailscale_ledger(dev, hostname, token_prefix, key_id, "issued")
+            set_job(dev, state="tailscale", percent=100,
+                    message=f"Tailscale key minted (id={key_id}) — will join on first boot")
 
         set_job(dev, state="done", percent=100,
                 message=f"Done — {hostname} configured & verified, safe to remove")
@@ -959,6 +1054,294 @@ def start_flash(devices, cfg):
     threading.Thread(target=runner, daemon=True).start()
 
 
+# ---------------------------------------------------------------- tailscale provisioning
+#
+# Ported from tailscale_auth/flashing_station's provision-card.sh +
+# pi/firstboot-tailscale.sh. Per card: mint a 24h non-reusable, preauthorized
+# Tailscale auth key (either via a mint server that holds the real API
+# credential, or directly against the Tailscale API using a local key file),
+# GPG-AES256-encrypt it onto the card's root filesystem under a per-card
+# random token, and install a first-boot systemd service that decrypts,
+# joins the tailnet, then shreds the key/token and removes itself.
+#
+# Security model (same as the original): the Tailscale API credential never
+# touches the card. The per-card token does ride on the card (needed to
+# decrypt at boot, since the Pi never calls the mint server) — a `dd` clone
+# of the card copies it too, so this is NOT anti-clone. Runtime protection is
+# the key's non-reusable + 24h-expiry + tag ACLs, same as upstream.
+
+TAILSCALE_SERVICE_UNIT = """[Unit]
+Description=PiForge: join Tailscale with per-card provisioned key (first boot only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/firstboot-tailscale.sh
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+# __TAILSCALE_TAG__ is substituted at install time (not Python str.format —
+# the script is full of literal ${...}/${i}-style bash expansions that would
+# collide with format()'s braces).
+TAILSCALE_FIRSTBOOT_SCRIPT = r"""#!/usr/bin/env bash
+#
+# firstboot-tailscale.sh — installed by PiForge, runs ONCE at first boot via
+# tailscale-provision.service. Decrypts the per-card Tailscale auth key
+# (GPG AES-256, passphrase = the per-card token also on this card), joins
+# the tailnet under this Pi's already-configured hostname, then shreds the
+# key/token and removes itself so nothing sensitive survives.
+set -euo pipefail
+
+D=/etc/pi-provision
+LOGF=/var/log/tailscale-provision.log
+exec >>"$LOGF" 2>&1
+echo "==== first-boot tailscale provision $(date -u +%Y-%m-%dT%H:%M:%SZ) ===="
+
+fail() { echo "PROVISION FAIL: $*"; exit 1; }
+
+if [[ -f "$D/build.sha256" ]]; then
+  ( cd "$D" && sha256sum -c build.sha256 >/dev/null 2>&1 ) || fail "build stamp mismatch"
+fi
+
+# network-online.target does not reliably wait for wifi + DNS on Pi OS —
+# poll for real reachability instead of trusting unit ordering alone.
+NET_OK=0
+for i in $(seq 1 60); do
+  if curl -fsI --max-time 5 https://tailscale.com >/dev/null 2>&1; then
+    NET_OK=1; break
+  fi
+  [[ $((i % 6)) -eq 0 ]] && echo "waiting for network... (${i}0s)"
+  sleep 5
+done
+[[ "$NET_OK" == "1" ]] || fail "no internet after 5min (wifi/route not up)"
+echo "network reachable"
+
+[[ -f "$D/token"       ]] || fail "no token on card"
+[[ -f "$D/authkey.gpg" ]] || fail "no encrypted auth key on card"
+TOKEN="$(cat "$D/token")"
+[[ -n "$TOKEN" ]] || fail "token is empty"
+
+AUTHKEY="$(gpg --batch --yes --pinentry-mode loopback --passphrase "$TOKEN" \
+              --decrypt "$D/authkey.gpg" 2>/dev/null)" \
+  || fail "decrypt failed (wrong token or tampered file)"
+[[ -n "$AUTHKEY" ]] || fail "decrypted auth key is empty"
+echo "auth key decrypted"
+
+# First boot after imaging races unattended-upgrades for the apt/dpkg locks —
+# stop the auto-update units and clear any lock holder before installing.
+APT_LOCKS="/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock"
+clear_apt() {
+  systemctl stop unattended-upgrades.service apt-daily.service \
+                 apt-daily-upgrade.service apt-daily.timer \
+                 apt-daily-upgrade.timer 2>/dev/null || true
+  if command -v fuser >/dev/null 2>&1 && fuser $APT_LOCKS >/dev/null 2>&1; then
+    fuser -k -TERM $APT_LOCKS 2>/dev/null || true
+    sleep 5
+    fuser -k -KILL $APT_LOCKS 2>/dev/null || true
+    sleep 2
+  fi
+  dpkg --configure -a 2>/dev/null || true
+}
+
+if ! command -v tailscale >/dev/null 2>&1; then
+  echo "installing tailscale"
+  INSTALLED=0
+  for attempt in 1 2 3; do
+    clear_apt
+    if curl -fsSL https://tailscale.com/install.sh | sh; then INSTALLED=1; break; fi
+    echo "tailscale install attempt ${attempt} failed — retrying"
+    sleep 10
+  done
+  [[ "$INSTALLED" == "1" ]] || fail "tailscale install failed after 3 attempts"
+fi
+
+# PiForge already set this Pi's real hostname via firstrun.sh on the boot
+# before this one — reuse it as the tailnet node name instead of a synthetic
+# serial-based one, so each card's Tailscale identity matches what's on the
+# label.
+HOST="$(hostname)"
+echo "bringing up tailscale as ${HOST}"
+tailscale up \
+  --authkey="$AUTHKEY" \
+  --hostname="$HOST" \
+  --advertise-tags=__TAILSCALE_TAG__ \
+  --ssh=false \
+  --accept-routes=false \
+  || fail "tailscale up failed (key expired >24h? already used?)"
+unset AUTHKEY
+
+shred -u "$D/authkey.gpg" 2>/dev/null || rm -f "$D/authkey.gpg"
+shred -u "$D/token"       2>/dev/null || rm -f "$D/token"
+
+# Success only (set -e never reaches here on failure, so retries stay
+# intact next boot). Keeps key-id + build stamp under /etc/pi-provision for
+# audit — neither is sensitive on its own.
+systemctl disable tailscale-provision.service 2>/dev/null || true
+rm -f /etc/systemd/system/multi-user.target.wants/tailscale-provision.service \
+      /etc/systemd/system/tailscale-provision.service
+systemctl daemon-reload || true
+rm -f /usr/local/sbin/firstboot-tailscale.sh
+echo "PROVISION OK: joined tailnet as ${HOST}"
+"""
+
+
+def reader_serial(dev):
+    """Physical card-reader hardware serial (for ledger audit — which
+    reader inserted this card), not the card's own serial."""
+    try:
+        out = subprocess.run(["udevadm", "info", "--query=property", f"--name={dev}"],
+                              capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            if line.startswith("ID_SERIAL="):
+                return line.split("=", 1)[1]
+    except Exception:
+        pass
+    return "unknown"
+
+
+def mint_tailscale_key(tconf, token, reader):
+    """Returns (authkey, key_id, minted_via_server). Prefers
+    tconf['mint_endpoint'] — a server that holds the real Tailscale API
+    credential and mints on our behalf, so this station never sees it —
+    and falls back to calling the Tailscale API directly with a local API
+    key file, exactly like provision-card.sh does."""
+    if tconf.get("mint_endpoint"):
+        req = urllib.request.Request(
+            tconf["mint_endpoint"],
+            data=json.dumps({"token": token, "reader": reader}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        if tconf.get("ledger_auth_token"):
+            req.add_header("Authorization", f"Bearer {tconf['ledger_auth_token']}")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+        minted_via_server = True
+    else:
+        apikey_path = tconf.get("ts_apikey_file") or ""
+        if not apikey_path:
+            raise RuntimeError("no mint_endpoint configured and no ts_apikey_file set")
+        if not os.path.isabs(apikey_path):
+            apikey_path = os.path.join(real_home(), apikey_path)
+        with open(apikey_path) as f:
+            apikey = f.read().strip()
+        if not apikey:
+            raise RuntimeError(f"API key file is empty: {apikey_path}")
+        tailnet = tconf.get("tailnet", "-") or "-"
+        tag = tconf.get("tag", "tag:production")
+        body = json.dumps({
+            "capabilities": {"devices": {"create": {
+                "reusable": False, "ephemeral": False, "preauthorized": True,
+                "tags": [tag],
+            }}},
+            "expirySeconds": int(tconf.get("key_ttl_seconds", 86400) or 86400),
+            "description": f"piforge-{token[:12]}-{time.strftime('%Y%m%d-%H%M%S')}",
+        }).encode()
+        req = urllib.request.Request(
+            f"https://api.tailscale.com/api/v2/tailnet/{tailnet}/keys",
+            data=body, headers={"Content-Type": "application/json"}, method="POST")
+        req.add_header("Authorization", "Basic " + base64.b64encode(f"{apikey}:".encode()).decode())
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+        minted_via_server = False
+
+    authkey = data.get("key")
+    key_id = data.get("id", "")
+    if not authkey:
+        raise RuntimeError(f"no key in mint response: {data}")
+    return authkey, key_id, minted_via_server
+
+
+def gpg_encrypt_authkey(token, authkey, out_path):
+    """GPG symmetric AES-256, passphrase = the per-card token, loopback so
+    it's non-interactive — same parameters as provision-card.sh."""
+    tmp_fd, tmp_path = tempfile.mkstemp()
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            f.write(authkey)
+        subprocess.run(
+            ["gpg", "--batch", "--yes", "--pinentry-mode", "loopback",
+             "--passphrase", token, "--symmetric", "--cipher-algo", "AES256",
+             "--s2k-mode", "3", "--s2k-count", "65011712", "--s2k-digest-algo", "SHA512",
+             "-o", out_path, tmp_path],
+            check=True, capture_output=True)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                subprocess.run(["shred", "-u", tmp_path], check=True, capture_output=True)
+            except Exception:
+                os.remove(tmp_path)
+
+
+def install_tailscale_provisioning(dev, root_mount, tconf):
+    """Mint a per-card Tailscale auth key, GPG-encrypt it onto the card
+    under a per-card token, and install the first-boot service that joins
+    the tailnet then self-deletes. Returns (key_id, token_prefix, reader)
+    for the ledger."""
+    token = os.urandom(32).hex()
+    reader = reader_serial(dev)
+    authkey, key_id, minted_via_server = mint_tailscale_key(tconf, token, reader)
+
+    prov_dir = os.path.join(root_mount, "etc", "pi-provision")
+    os.makedirs(prov_dir, exist_ok=True)
+
+    gpg_encrypt_authkey(token, authkey, os.path.join(prov_dir, "authkey.gpg"))
+    with open(os.path.join(prov_dir, "token"), "w") as f:
+        f.write(token)
+    with open(os.path.join(prov_dir, "key-id"), "w") as f:
+        f.write(key_id)
+    for name in ("authkey.gpg", "token", "key-id"):
+        os.chmod(os.path.join(prov_dir, name), 0o600)
+
+    marker_path = os.path.join(prov_dir, "build.marker")
+    with open(marker_path, "w") as f:
+        f.write("piforge-tailscale-build-v1\n")
+    with open(marker_path, "rb") as f:
+        marker_hash = hashlib.sha256(f.read()).hexdigest()
+    with open(os.path.join(prov_dir, "build.sha256"), "w") as f:
+        f.write(f"{marker_hash}  build.marker\n")
+
+    sbin_path = os.path.join(root_mount, "usr", "local", "sbin", "firstboot-tailscale.sh")
+    os.makedirs(os.path.dirname(sbin_path), exist_ok=True)
+    tag = tconf.get("tag", "tag:production")
+    with open(sbin_path, "w") as f:
+        f.write(TAILSCALE_FIRSTBOOT_SCRIPT.replace("__TAILSCALE_TAG__", tag))
+    os.chmod(sbin_path, 0o755)
+
+    unit_dir = os.path.join(root_mount, "etc", "systemd", "system")
+    os.makedirs(unit_dir, exist_ok=True)
+    with open(os.path.join(unit_dir, "tailscale-provision.service"), "w") as f:
+        f.write(TAILSCALE_SERVICE_UNIT)
+    wants_dir = os.path.join(unit_dir, "multi-user.target.wants")
+    os.makedirs(wants_dir, exist_ok=True)
+    link_path = os.path.join(wants_dir, "tailscale-provision.service")
+    if os.path.lexists(link_path):
+        os.remove(link_path)
+    os.symlink("../tailscale-provision.service", link_path)
+
+    # The mint server already records its own ledger row when it minted the
+    # key — only push here on the direct-API fallback path, same as upstream.
+    if tconf.get("ledger_endpoint") and not minted_via_server:
+        try:
+            body = json.dumps({
+                "token": token, "key_id": key_id,
+                "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "reader": reader, "status": "issued",
+            }).encode()
+            req = urllib.request.Request(
+                tconf["ledger_endpoint"], data=body,
+                headers={"Content-Type": "application/json"}, method="POST")
+            if tconf.get("ledger_auth_token"):
+                req.add_header("Authorization", f"Bearer {tconf['ledger_auth_token']}")
+            urllib.request.urlopen(req, timeout=15)
+        except Exception:
+            pass  # best-effort — the local ledger row below always lands
+
+    return key_id, token[:12], reader
+
+
 # ---------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
@@ -1032,6 +1415,11 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/history":
             limit = int(query.get("limit", ["50"])[0])
             self._json({"rows": read_history(limit)})
+        elif path == "/api/tailscale-config":
+            self._json(load_tailscale_config())
+        elif path == "/api/tailscale-ledger":
+            limit = int(query.get("limit", ["50"])[0])
+            self._json({"rows": read_tailscale_ledger(limit)})
         else:
             self._json({"error": "not found"}, 404)
 
@@ -1091,6 +1479,17 @@ class Handler(BaseHTTPRequestHandler):
                                        "keep_existing": int(part.get("keep_existing", 0) or 0),
                                        "partitions": part["partitions"]}
                     save_partition_profiles(pprofiles)
+                self._json({"ok": True})
+            except Exception as e:
+                self._json({"error": str(e)}, 400)
+            return
+
+        if parsed.path == "/api/tailscale-config":
+            try:
+                req = json.loads(body)
+                cfg = dict(TAILSCALE_DEFAULTS)
+                cfg.update({k: req[k] for k in TAILSCALE_DEFAULTS if k in req})
+                save_tailscale_config(cfg)
                 self._json({"ok": True})
             except Exception as e:
                 self._json({"error": str(e)}, 400)

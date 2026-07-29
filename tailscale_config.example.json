@@ -1,0 +1,9 @@
+{
+  "mint_endpoint": "",
+  "ledger_endpoint": "",
+  "ledger_auth_token": "",
+  "ts_apikey_file": "",
+  "tailnet": "-",
+  "tag": "tag:production",
+  "key_ttl_seconds": 86400
+}

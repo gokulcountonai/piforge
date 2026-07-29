@@ -28,6 +28,7 @@ depends=(
   'parted'
   'dosfstools'
   'e2fsprogs'
+  'gnupg'
   'jq'
   'curl'
   'polkit'
@@ -44,6 +45,7 @@ package() {
   install -m 0755 "$src/firstrun_gen.py" "$pkgdir/opt/piforge/firstrun_gen.py"
   install -m 0644 "$src/config.example.json" "$pkgdir/opt/piforge/config.example.json"
   install -m 0644 "$src/profiles.example.json" "$pkgdir/opt/piforge/profiles.example.json"
+  install -m 0644 "$src/tailscale_config.example.json" "$pkgdir/opt/piforge/tailscale_config.example.json"
   install -m 0755 "$src/flash-all.sh" "$pkgdir/opt/piforge/flash-all.sh"
   install -m 0755 "$src/inject-config.sh" "$pkgdir/opt/piforge/inject-config.sh"
   install -m 0755 "$src/check-requirements.sh" "$pkgdir/opt/piforge/check-requirements.sh"

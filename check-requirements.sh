@@ -27,6 +27,9 @@ need mkfs.vfat    "sudo apt install dosfstools"
 need mkfs.ext4    "sudo apt install e2fsprogs"
 need jq           "sudo apt install jq"
 need curl         "sudo apt install curl"
+need gpg          "sudo apt install gnupg"
+need shred        "sudo apt install coreutils"
+need udevadm      "sudo apt install udev"
 
 echo
 echo "Optional (only needed for flash-all.sh, the CLI-only path):"

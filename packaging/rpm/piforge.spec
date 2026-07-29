@@ -26,6 +26,7 @@ Requires:       wpa_supplicant
 Requires:       parted
 Requires:       dosfstools
 Requires:       e2fsprogs
+Requires:       gnupg2
 Requires:       jq
 Requires:       curl
 Requires:       polkit
@@ -60,6 +61,7 @@ install -m 0644 index.html %{buildroot}/opt/piforge/index.html
 install -m 0755 firstrun_gen.py %{buildroot}/opt/piforge/firstrun_gen.py
 install -m 0644 config.example.json %{buildroot}/opt/piforge/config.example.json
 install -m 0644 profiles.example.json %{buildroot}/opt/piforge/profiles.example.json
+install -m 0644 tailscale_config.example.json %{buildroot}/opt/piforge/tailscale_config.example.json
 install -m 0755 flash-all.sh %{buildroot}/opt/piforge/flash-all.sh
 install -m 0755 inject-config.sh %{buildroot}/opt/piforge/inject-config.sh
 install -m 0755 check-requirements.sh %{buildroot}/opt/piforge/check-requirements.sh
