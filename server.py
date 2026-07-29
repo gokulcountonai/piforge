@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -32,6 +33,11 @@ from firstrun_gen import sh_hash_password, wifi_psk, make_firstrun, compute_stat
 PORT = 47823
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_IMAGE_URL = "https://downloads.raspberrypi.com/raspios_oldstable_arm64_latest"
+# Where /usr/bin/piforge (the desktop launcher) redirects this process's own
+# stdout/stderr when it starts the server via pkexec — same path, hardcoded
+# here too, so the UI's "view server log" can read it. Absent (not an
+# error) when server.py is run directly instead of through the launcher.
+SERVER_LOG_PATH = "/tmp/piforge-server.log"
 
 
 def real_home():
@@ -110,7 +116,6 @@ BUILTIN_DEFAULTS = {
     "static_ip_dns": "",
     "static_ip_iface": "eth0",
     "notify_on_finish": False,
-    "tailscale_enabled": False,
 }
 
 # Station-wide Tailscale provisioning settings — not per-card, not part of a
@@ -269,6 +274,18 @@ def read_tailscale_ledger(limit=50):
     with open(TAILSCALE_LEDGER_PATH, newline="") as f:
         rows = list(csv.DictReader(f))
     return list(reversed(rows))[:limit]
+
+
+def tail_file(path, max_lines=300):
+    """Last N lines of a log file — best-effort, empty string (not an
+    error) if the file doesn't exist, since most of these logs are only
+    written under specific launch modes."""
+    try:
+        with open(path, errors="replace") as f:
+            return "".join(f.readlines()[-max_lines:])
+    except OSError:
+        return ""
+
 
 # ---------------------------------------------------------------- state
 
@@ -536,6 +553,25 @@ def root_partition(dev):
     return None
 
 
+def full_error_text(e):
+    """Untruncated error text for the "View details" panel — job.message
+    stays short for the card summary, but that's not enough to actually
+    debug a failure (e.g. a 502 from a mint server, with no indication of
+    which URL or what the body said). CalledProcessError gets its full
+    stderr; anything else gets its full traceback."""
+    if isinstance(e, subprocess.CalledProcessError):
+        cmd = " ".join(e.cmd) if isinstance(e.cmd, (list, tuple)) else str(e.cmd)
+        err = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else str(e.stderr or "")
+        out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else str(e.stdout or "")
+        parts = [f"$ {cmd}", f"exit code: {e.returncode}"]
+        if err.strip():
+            parts.append(f"stderr:\n{err.strip()}")
+        if out.strip():
+            parts.append(f"stdout:\n{out.strip()}")
+        return "\n\n".join(parts)[:8000]
+    return "".join(traceback.format_exception(type(e), e, e.__traceback__))[:8000]
+
+
 class Cancelled(Exception):
     """Raised inside flash_device when the user cancelled this card."""
 
@@ -649,26 +685,6 @@ def flash_device(dev, cfg, hostname, static_ip=None):
             subprocess.run(["umount", mnt], capture_output=True)
             os.rmdir(mnt)
 
-        if cfg.get("tailscale_enabled"):
-            check_cancelled(dev)
-            set_job(dev, state="tailscale", percent=100, message="Minting Tailscale key…")
-            root_part = root_partition(dev)
-            if not root_part:
-                raise RuntimeError("root partition not found for Tailscale provisioning")
-            subprocess.run(["umount", root_part], capture_output=True)
-            rmnt = tempfile.mkdtemp(prefix="rootfs-")
-            try:
-                subprocess.run(["mount", root_part, rmnt], check=True, capture_output=True)
-                tconf = load_tailscale_config()
-                key_id, token_prefix, _reader = install_tailscale_provisioning(dev, rmnt, tconf)
-                subprocess.run(["sync"])
-            finally:
-                subprocess.run(["umount", rmnt], capture_output=True)
-                os.rmdir(rmnt)
-            log_tailscale_ledger(dev, hostname, token_prefix, key_id, "issued")
-            set_job(dev, state="tailscale", percent=100,
-                    message=f"Tailscale key minted (id={key_id}) — will join on first boot")
-
         set_job(dev, state="done", percent=100,
                 message=f"Done — {hostname} configured & verified, safe to remove")
         log_history(dev, hostname, "done", time.time() - start_time, image_url)
@@ -679,7 +695,7 @@ def flash_device(dev, cfg, hostname, static_ip=None):
         log_history(dev, hostname, "cancelled", time.time() - start_time, image_url)
     except Exception as e:
         unregister_proc(dev)
-        set_job(dev, state="error", percent=0, message=str(e)[:300])
+        set_job(dev, state="error", percent=0, message=str(e)[:300], detail=full_error_text(e))
         log_history(dev, hostname, "error", time.time() - start_time, image_url)
 
 
@@ -814,8 +830,35 @@ def plan_partitions(dev, profile):
         # Remove them first; highest number first so an MBR extended
         # container isn't deleted out from under its own logicals.
         to_remove = sorted((p["number"] for p in existing["partitions"] if p["number"] > keep_existing), reverse=True)
+
+        resize_info = None
+        resize_mib = profile.get("resize_last_kept_mib")
+        if resize_mib:
+            # Grow/shrink the LAST kept partition (typically root) to an
+            # exact target before placing new partitions after it — ported
+            # from prep-supernova-card.sh's "resize root to ROOT_GIB" step,
+            # which the original always does before cutting the partitions
+            # that follow it.
+            last_kept = max(kept, key=lambda p: p["number"])
+            new_end = last_kept["start_mib"] + float(resize_mib)
+            if new_end <= last_kept["start_mib"] + 1:
+                raise RuntimeError("resize_last_kept_mib must be positive")
+            if new_end > disk_mib - 1.0:
+                raise RuntimeError(
+                    f"resize target ({resize_mib:.0f}MiB) doesn't fit — only "
+                    f"{disk_mib - 1.0 - last_kept['start_mib']:.0f}MiB available on this card")
+            resize_info = {
+                "number": last_kept["number"],
+                "start_mib": last_kept["start_mib"],
+                "old_end_mib": last_kept["end_mib"],
+                "new_end_mib": new_end,
+                "fstype": last_kept.get("fstype") or "ext4",
+                "name": last_kept.get("name") or "root",
+            }
+            cursor = new_end
     else:
         cursor = 1.0  # standard 1 MiB alignment for a fresh table
+        resize_info = None
 
     # 1 MiB end slack for every table type, not just GPT (whose backup
     # partition table needs it) — confirmed against a real loopback device
@@ -864,7 +907,59 @@ def plan_partitions(dev, profile):
                      "number": number, "start_mib": cursor, "end_mib": end, "spec": p})
         cursor = end + (1.0 if is_logical else 0.0)
 
-    return label_type, plan, to_remove
+    return label_type, plan, to_remove, resize_info
+
+
+def resize_root_partition(dev, label_type, info):
+    """Resize an existing kept partition (typically root) to a new target
+    size — ported from prep-supernova-card.sh's root-resize step. ext4
+    only, ordered so parted never has to shrink a partition table entry
+    in place (it refuses that as a data-loss prompt): shrink the
+    filesystem safely below the new boundary first, recreate the
+    partition at the exact target, then grow the filesystem to fill it;
+    for a grow, widen the partition first, then grow the filesystem."""
+    number = info["number"]
+    path = part_path(dev, number)
+    old_mib = info["old_end_mib"] - info["start_mib"]
+    new_mib = info["new_end_mib"] - info["start_mib"]
+    start_arg = f"{round(info['start_mib'])}MiB"
+    end_arg = f"{round(info['new_end_mib'])}MiB"
+    kind_or_name = (info["name"][:36] if label_type == "gpt"
+                    else ("logical" if number >= 5 else "primary"))
+
+    subprocess.run(["umount", path], capture_output=True)
+
+    set_job(dev, state="partitioning", percent=3, message=f"Checking filesystem on partition {number}…")
+    # e2fsck preen mode: 0/1 are fine (clean, or minor issues auto-fixed);
+    # >=4 needs a human — same tolerance prep-supernova-card.sh uses.
+    r = subprocess.run(["e2fsck", "-f", "-p", path], capture_output=True)
+    if r.returncode >= 4:
+        raise RuntimeError(
+            f"e2fsck returned {r.returncode} on partition {number} — needs manual repair, stopping")
+
+    if new_mib < old_mib - 1:
+        shrink_target_mib = round(new_mib) - 64
+        if shrink_target_mib < 64:
+            raise RuntimeError(f"resize target too small for partition {number} (needs >64MiB headroom)")
+        set_job(dev, state="partitioning", percent=4, message=f"Shrinking filesystem on partition {number}…")
+        subprocess.run(["resize2fs", path, f"{shrink_target_mib}M"], check=True, capture_output=True)
+        set_job(dev, state="partitioning", percent=4, message=f"Re-cutting partition {number}…")
+        subprocess.run(["parted", "--script", dev, "rm", str(number),
+                        "mkpart", kind_or_name, info["fstype"], start_arg, end_arg],
+                        check=True, capture_output=True)
+        subprocess.run(["partprobe", dev], capture_output=True)
+        path = wait_for_part(dev, number) or path
+        set_job(dev, state="partitioning", percent=4, message=f"Growing filesystem to fill partition {number}…")
+        subprocess.run(["resize2fs", path], check=True, capture_output=True)
+    else:
+        set_job(dev, state="partitioning", percent=4, message=f"Growing partition {number}…")
+        subprocess.run(["parted", "--script", dev, "rm", str(number),
+                        "mkpart", kind_or_name, info["fstype"], start_arg, end_arg],
+                        check=True, capture_output=True)
+        subprocess.run(["partprobe", dev], capture_output=True)
+        path = wait_for_part(dev, number) or path
+        set_job(dev, state="partitioning", percent=4, message=f"Growing filesystem to fill partition {number}…")
+        subprocess.run(["resize2fs", path], check=True, capture_output=True)
 
 
 def partition_device(dev, profile):
@@ -882,7 +977,7 @@ def partition_device(dev, profile):
         # errored. (keep_existing>0 reads the current table instead, which
         # is unaffected either way since nothing's wiped in that branch.)
         check_cancelled(dev)
-        label_type, plan, to_remove = plan_partitions(dev, profile)
+        label_type, plan, to_remove, resize_info = plan_partitions(dev, profile)
         new_parts = [e for e in plan if e["kind"] != "extended"]
 
         if keep_existing == 0:
@@ -899,6 +994,9 @@ def partition_device(dev, profile):
                         message=f"Removing old partition {number}…")
                 subprocess.run(["parted", "--script", dev, "rm", str(number)],
                                 check=True, capture_output=True)
+            if resize_info:
+                check_cancelled(dev)
+                resize_root_partition(dev, label_type, resize_info)
 
         for idx, entry in enumerate(plan, start=1):
             check_cancelled(dev)
@@ -960,10 +1058,10 @@ def partition_device(dev, profile):
         log_history(dev, "", "cancelled", time.time() - start_time, "")
     except subprocess.CalledProcessError as e:
         err = e.stderr.decode(errors="replace")[:300] if isinstance(e.stderr, bytes) else str(e)[:300]
-        set_job(dev, state="error", percent=0, message=err or str(e)[:300])
+        set_job(dev, state="error", percent=0, message=err or str(e)[:300], detail=full_error_text(e))
         log_history(dev, "", "error", time.time() - start_time, "")
     except Exception as e:
-        set_job(dev, state="error", percent=0, message=str(e)[:300])
+        set_job(dev, state="error", percent=0, message=str(e)[:300], detail=full_error_text(e))
         log_history(dev, "", "error", time.time() - start_time, "")
 
 
@@ -1003,7 +1101,7 @@ def start_partition(devices, profile):
 
     threads = []
     for dev in devices:
-        set_job(dev, state="queued", percent=0, message="Queued…", hostname=None)
+        set_job(dev, state="queued", percent=0, message="Queued…", hostname=None, detail="")
         t = threading.Thread(target=partition_device, args=(dev, profile), daemon=True)
         threads.append(t)
 
@@ -1039,7 +1137,7 @@ def start_flash(devices, cfg):
         hostname = (f"{cfg['hostname']}{i}" if cfg.get("number_hostnames", True)
                     else cfg["hostname"])
         static_ip = compute_static_ip(cfg["static_ip_base"], i) if cfg.get("static_ip_base") else None
-        set_job(dev, state="queued", percent=0, message="Queued…", hostname=hostname)
+        set_job(dev, state="queued", percent=0, message="Queued…", hostname=hostname, detail="")
         t = threading.Thread(target=flash_device, args=(dev, cfg, hostname, static_ip), daemon=True)
         threads.append(t)
 
@@ -1342,6 +1440,76 @@ def install_tailscale_provisioning(dev, root_mount, tconf):
     return key_id, token[:12], reader
 
 
+def tailscale_provision_device(dev):
+    """Tailscale join for a card that's already flashed AND partitioned
+    (e.g. via prep-supernova-card.sh, or PiForge's own Flash OS + Partition
+    cards stages) — mounts its existing root partition and runs
+    install_tailscale_provisioning() without touching anything else on the
+    card. This is the sole way PiForge does Tailscale provisioning — it is
+    never baked into flash_device()'s own pipeline, by design."""
+    start_time = time.time()
+    try:
+        check_cancelled(dev)
+        set_job(dev, state="tailscale", percent=0, message="Unmounting…")
+        subprocess.run(f"umount {dev}?* 2>/dev/null", shell=True)
+
+        root_part = root_partition(dev)
+        if not root_part:
+            raise RuntimeError("root partition not found — card must be partitioned first")
+
+        check_cancelled(dev)
+        set_job(dev, state="tailscale", percent=10, message="Minting Tailscale key…")
+        rmnt = tempfile.mkdtemp(prefix="rootfs-")
+        try:
+            subprocess.run(["mount", root_part, rmnt], check=True, capture_output=True)
+            tconf = load_tailscale_config()
+            key_id, token_prefix, _reader = install_tailscale_provisioning(dev, rmnt, tconf)
+            subprocess.run(["sync"])
+        finally:
+            subprocess.run(["umount", rmnt], capture_output=True)
+            os.rmdir(rmnt)
+
+        log_tailscale_ledger(dev, "", token_prefix, key_id, "issued")
+        set_job(dev, state="done", percent=100,
+                message=f"Done — Tailscale key minted (id={key_id}), will join on first boot")
+        log_history(dev, "", "tailscale-provisioned", time.time() - start_time, f"tailscale key={key_id}")
+    except Cancelled:
+        unregister_proc(dev)
+        set_job(dev, state="cancelled", percent=0,
+                message="Cancelled — card may be left half-provisioned")
+        log_history(dev, "", "cancelled", time.time() - start_time, "")
+    except subprocess.CalledProcessError as e:
+        err = e.stderr.decode(errors="replace")[:300] if isinstance(e.stderr, bytes) else str(e)[:300]
+        set_job(dev, state="error", percent=0, message=err or str(e)[:300], detail=full_error_text(e))
+        log_history(dev, "", "error", time.time() - start_time, "")
+    except Exception as e:
+        set_job(dev, state="error", percent=0, message=str(e)[:300], detail=full_error_text(e))
+        log_history(dev, "", "error", time.time() - start_time, "")
+
+
+def start_tailscale_provision(devices):
+    all_present = sorted(d["device"] for d in list_devices())
+    bad = [d for d in devices if d not in all_present]
+    if bad:
+        raise ValueError(f"not a removable/safe device: {', '.join(bad)}")
+
+    threads = []
+    for dev in devices:
+        set_job(dev, state="queued", percent=0, message="Queued…", hostname=None, detail="")
+        t = threading.Thread(target=tailscale_provision_device, args=(dev,), daemon=True)
+        threads.append(t)
+
+    def runner():
+        FLASH_ACTIVE.set()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        FLASH_ACTIVE.clear()
+
+    threading.Thread(target=runner, daemon=True).start()
+
+
 # ---------------------------------------------------------------- HTTP
 
 class Handler(BaseHTTPRequestHandler):
@@ -1420,6 +1588,15 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/tailscale-ledger":
             limit = int(query.get("limit", ["50"])[0])
             self._json({"rows": read_tailscale_ledger(limit)})
+        elif path == "/api/logs-view":
+            device = (query.get("device") or [""])[0]
+            device_log = ""
+            if device:
+                device_log = tail_file(f"/tmp/flash-{os.path.basename(device)}.log")
+            self._json({
+                "server_log": tail_file(SERVER_LOG_PATH),
+                "device_log": device_log,
+            })
         else:
             self._json({"error": "not found"}, 404)
 
@@ -1453,6 +1630,7 @@ class Handler(BaseHTTPRequestHandler):
                 profiles = load_partition_profiles()
                 profiles[name] = {"table": req.get("table", "gpt"),
                                    "keep_existing": int(req.get("keep_existing", 0) or 0),
+                                   "resize_last_kept_mib": req.get("resize_last_kept_mib") or None,
                                    "partitions": req["partitions"]}
                 save_partition_profiles(profiles)
                 self._json({"ok": True})
@@ -1477,6 +1655,7 @@ class Handler(BaseHTTPRequestHandler):
                     pprofiles = load_partition_profiles()
                     pprofiles[name] = {"table": part.get("table", "gpt"),
                                        "keep_existing": int(part.get("keep_existing", 0) or 0),
+                                       "resize_last_kept_mib": part.get("resize_last_kept_mib") or None,
                                        "partitions": part["partitions"]}
                     save_partition_profiles(pprofiles)
                 self._json({"ok": True})
@@ -1507,6 +1686,22 @@ class Handler(BaseHTTPRequestHandler):
                 if not devices:
                     raise ValueError("no devices selected")
                 start_partition(devices, profile)
+                self._json({"ok": True, "count": len(devices)})
+            except Exception as e:
+                self._json({"error": str(e)}, 400)
+            return
+
+        if parsed.path == "/api/tailscale-provision":
+            if os.geteuid() != 0:
+                return self._json({"error": "server not running as root — restart with sudo"}, 403)
+            if FLASH_ACTIVE.is_set():
+                return self._json({"error": "an operation is already in progress"}, 409)
+            try:
+                req = json.loads(body)
+                devices = req["devices"]
+                if not devices:
+                    raise ValueError("no devices selected")
+                start_tailscale_provision(devices)
                 self._json({"ok": True, "count": len(devices)})
             except Exception as e:
                 self._json({"error": str(e)}, 400)

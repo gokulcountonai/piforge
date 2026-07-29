@@ -277,6 +277,12 @@
   }
   .modal-close:hover { color: var(--ink); }
   .modal-body { padding: 1rem 1.2rem; overflow-y: auto; min-height: 0; }
+  .logbox {
+    background: var(--ink); color: #D8D8D6; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.78rem; line-height: 1.4; padding: 0.8rem 1rem; border-radius: 8px;
+    white-space: pre-wrap; word-break: break-word; max-height: 40vh; overflow-y: auto;
+  }
+  .modal .subhead { margin-top: 1rem; }
 </style>
 </head>
 <body>
@@ -448,6 +454,10 @@
       </div>
       <div class="hint" id="pp_current_layout"></div>
 
+      <label style="margin-top:0.7rem">Resize the last kept partition to (MiB, optional)</label>
+      <input type="number" id="pp_resize_last_kept_mib" placeholder="e.g. 51200 for 50 GiB" min="0" step="1">
+      <div class="hint">Only applies when "existing partitions to keep" is above 0 — grows or shrinks that partition (e.g. root) to this exact size before the new partitions below are added after it. Leave blank to leave it untouched.</div>
+
       <div class="subhead">New partitions <span class="pp_total" id="pp_total"></span></div>
       <div class="partbar" id="partbar"></div>
       <div class="partlist" id="partlist"></div>
@@ -494,12 +504,9 @@
     </section>
 
     <section class="panel">
-      <h2>Join on first boot</h2>
-      <div class="check">
-        <input type="checkbox" id="tailscale_enabled">
-        <span>Mint a per-card Tailscale key and join the tailnet on first boot</span>
-      </div>
-      <div class="hint">Each card gets its own 24h, non-reusable, preauthorized key — GPG-encrypted onto the card under a per-card token, decrypted and used by a first-boot service that then deletes itself. Requires <code>gpg</code> on this station.</div>
+      <h2>Provision now</h2>
+      <div class="hint">For a card that's already flashed and partitioned (e.g. via the "2 · Partition cards" tab, or elsewhere) — mints and installs the Tailscale key directly, without re-flashing or re-partitioning anything.</div>
+      <button class="primary" id="btn-tailscale" style="margin-top:0.9rem" disabled>SELECT CARDS</button>
     </section>
   </div>
   </div>
@@ -544,6 +551,24 @@ all selected cards are written in parallel</footer>
     </div>
     <div class="modal-body" id="ts_ledger_body">
       <p class="hint">Last 50 keys issued.</p>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="error_modal" style="display:none">
+  <div class="modal">
+    <div class="modal-head">
+      <h3>🔍 Error details — <span id="error_modal_device"></span></h3>
+      <button type="button" class="modal-close" id="btn-error-close">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="logbox" id="error_modal_detail"></div>
+
+      <div class="subhead">Server log <button type="button" class="tiny" id="btn-load-server-log">⤓ Load</button></div>
+      <div class="logbox" id="error_modal_server_log" style="display:none"></div>
+
+      <div class="subhead">Device log (dd/verify output, if any) <button type="button" class="tiny" id="btn-load-device-log">⤓ Load</button></div>
+      <div class="logbox" id="error_modal_device_log" style="display:none"></div>
     </div>
   </div>
 </div>
@@ -747,7 +772,6 @@ all selected cards are written in parallel</footer>
       image_url: currentImageUrl(),
       verify: $("verify").checked,
       notify_on_finish: $("notify_on_finish").checked,
-      tailscale_enabled: $("tailscale_enabled").checked,
     };
   }
 
@@ -791,7 +815,6 @@ all selected cards are written in parallel</footer>
     if (cfg.image_url) setImageUrl(cfg.image_url);
     $("verify").checked = !!cfg.verify;
     $("notify_on_finish").checked = !!cfg.notify_on_finish;
-    $("tailscale_enabled").checked = !!cfg.tailscale_enabled;
   }
 
   // Baseline is always config.json (via the server) so a fresh browser with
@@ -841,6 +864,8 @@ all selected cards are written in parallel</footer>
       $("pp_table").value = ppTable;
       keepExisting = entry.partition.keep_existing || 0;
       $("pp_keep_existing").value = keepExisting;
+      resizeLastKeptMib = entry.partition.resize_last_kept_mib || null;
+      $("pp_resize_last_kept_mib").value = resizeLastKeptMib ?? "";
       partitions = entry.partition.partitions;
       selectedPart = 0;
       renderAll();
@@ -862,7 +887,7 @@ all selected cards are written in parallel</footer>
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         name, config: readForm(),
-        partition: { table: ppTable, keep_existing: keepExisting, partitions },
+        partition: { table: ppTable, keep_existing: keepExisting, resize_last_kept_mib: resizeLastKeptMib, partitions },
       }),
     })).json();
     if (res.error) { alert("Error: " + res.error); return; }
@@ -889,13 +914,14 @@ all selected cards are written in parallel</footer>
         return;
       }
       body.innerHTML = `<table class="history"><thead><tr>
-        <th>Time</th><th>Device</th><th>Hostname</th><th>Status</th><th>Duration</th>
+        <th>Time</th><th>Device</th><th>Hostname</th><th>Status</th><th>Duration</th><th>Detail</th>
         </tr></thead><tbody>${rows.map(r => `<tr>
           <td>${esc(r.timestamp || "")}</td>
           <td>${esc(r.device || "")}</td>
           <td>${esc(r.hostname || "")}</td>
           <td class="status-${esc(r.status || "")}">${esc((r.status || "").toUpperCase())}</td>
           <td>${esc(r.duration_s || "")}s</td>
+          <td>${esc(r.image_url || "")}</td>
         </tr>`).join("")}</tbody></table>`;
     });
   }
@@ -940,6 +966,7 @@ all selected cards are written in parallel</footer>
         <div class="devside">
           ${st ? `<span class="tag ${esc(st)} ${busy ? "pulse" : ""}">${esc(st.toUpperCase())}</span>` : ""}
           ${(st === "error" || st === "cancelled") && !flashing ? `<button type="button" class="tiny retry" data-retry="${esc(d.device)}">↻ Retry</button>` : ""}
+          ${st === "error" ? `<button type="button" class="tiny" data-details="${esc(d.device)}">🔍 Details</button>` : ""}
           ${busy && st !== "cancelling" ? `<button type="button" class="tiny danger" data-cancel="${esc(d.device)}">⏹ Stop</button>` : ""}
         </div>
       </div>`;
@@ -950,10 +977,15 @@ all selected cards are written in parallel</footer>
         render();
       }));
     grid.querySelectorAll("button[data-retry]").forEach(btn =>
-      btn.addEventListener("click", () => mode === "partition"
-        ? startPartitioning([btn.dataset.retry]) : startFlashing([btn.dataset.retry])));
+      btn.addEventListener("click", () => {
+        if (mode === "partition") startPartitioning([btn.dataset.retry]);
+        else if (mode === "tailscale") startTailscaleProvision([btn.dataset.retry]);
+        else startFlashing([btn.dataset.retry]);
+      }));
     grid.querySelectorAll("button[data-cancel]").forEach(btn =>
       btn.addEventListener("click", () => cancelCards([btn.dataset.cancel])));
+    grid.querySelectorAll("button[data-details]").forEach(btn =>
+      btn.addEventListener("click", () => openErrorDetails(btn.dataset.details)));
     updateButton();
   }
 
@@ -989,6 +1021,13 @@ all selected cards are written in parallel</footer>
     else {
       pbtn.disabled = n === 0 || pctSum() > 100.5;
       pbtn.textContent = n === 0 ? "SELECT CARDS" : `ERASE & PARTITION ${n} CARD${n > 1 ? "S" : ""}`;
+    }
+
+    const tbtn = $("btn-tailscale");
+    if (flashing) { tbtn.disabled = true; tbtn.textContent = "WORKING…"; }
+    else {
+      tbtn.disabled = n === 0;
+      tbtn.textContent = n === 0 ? "SELECT CARDS" : `JOIN TAILSCALE — ${n} CARD${n > 1 ? "S" : ""}`;
     }
   }
 
@@ -1067,6 +1106,7 @@ all selected cards are written in parallel</footer>
   let mode = "flash";
   let ppTable = "gpt";
   let keepExisting = 0;
+  let resizeLastKeptMib = null;
   let selectedPart = 0;
   let partitions = [
     { label: "boot", fstype: "fat32", size_mode: "percent", percent: 10, type: "primary", flags: ["boot"] },
@@ -1209,6 +1249,10 @@ all selected cards are written in parallel</footer>
   $("pp_keep_existing").addEventListener("input", () => {
     keepExisting = Math.max(0, parseInt($("pp_keep_existing").value, 10) || 0);
   });
+  $("pp_resize_last_kept_mib").addEventListener("input", () => {
+    const v = parseInt($("pp_resize_last_kept_mib").value, 10);
+    resizeLastKeptMib = Number.isFinite(v) && v > 0 ? v : null;
+  });
 
   $("btn-pp-read-current").addEventListener("click", async () => {
     const dev = [...selected].sort()[0];
@@ -1235,13 +1279,14 @@ all selected cards are written in parallel</footer>
 
   async function startPartitioning(devs) {
     if (!devs.length) return;
-    const verb = keepExisting > 0
+    let verb = keepExisting > 0
       ? `keep the first ${keepExisting} existing partition(s) and add ${partitions.length} new one(s) after them`
       : `ERASE the entire partition table and create ${partitions.length} new partition(s)`;
+    if (keepExisting > 0 && resizeLastKeptMib) verb += ` (resizing partition ${keepExisting} to ${resizeLastKeptMib}MiB first)`;
     if (!confirm(`On:\n\n${devs.join("\n")}\n\nthis will ${verb}. Continue?`)) return;
     const r = await fetch("/api/partition", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ devices: devs, profile: { table: ppTable, keep_existing: keepExisting, partitions } }),
+      body: JSON.stringify({ devices: devs, profile: { table: ppTable, keep_existing: keepExisting, resize_last_kept_mib: resizeLastKeptMib, partitions } }),
     });
     const res = await r.json();
     if (res.error) alert("Error: " + res.error);
@@ -1250,14 +1295,31 @@ all selected cards are written in parallel</footer>
   }
   $("btn-partition").addEventListener("click", () => startPartitioning([...selected].sort()));
 
+  async function startTailscaleProvision(devs) {
+    if (!devs.length) return;
+    if (!confirm(`On:\n\n${devs.join("\n")}\n\nmint a Tailscale key and install the first-boot join service. Continue?`)) return;
+    const r = await fetch("/api/tailscale-provision", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ devices: devs }),
+    });
+    const res = await r.json();
+    if (res.error) alert("Error: " + res.error);
+    else { flashing = true; updateButton(); }
+    poll();
+  }
+  $("btn-tailscale").addEventListener("click", () => startTailscaleProvision([...selected].sort()));
+
   renderAll();
 
   // ---------------------------------------------------- combined upload/download
-  $("btn-bundle-download").addEventListener("click", () => {
+  $("btn-bundle-download").addEventListener("click", async () => {
     const cfg = readForm();
+    let tailscale = null;
+    try { tailscale = await (await fetch("/api/tailscale-config")).json(); } catch { /* optional section */ }
     downloadJSON({
       config: cfg,
-      partition: { table: ppTable, keep_existing: keepExisting, partitions },
+      partition: { table: ppTable, keep_existing: keepExisting, resize_last_kept_mib: resizeLastKeptMib, partitions },
+      tailscale,
     }, `piforge-config-${cfg.hostname || "settings"}.json`);
   });
 
@@ -1273,39 +1335,59 @@ all selected cards are written in parallel</footer>
 
     const hasConfig = data.config && typeof data.config === "object";
     const hasPartition = data.partition && Array.isArray(data.partition.partitions) && data.partition.partitions.length;
-    if (!hasConfig && !hasPartition) {
-      alert("That file has no 'config' or 'partition' section — nothing to load.");
+    const hasTailscale = data.tailscale && typeof data.tailscale === "object";
+    if (!hasConfig && !hasPartition && !hasTailscale) {
+      alert("That file has no 'config', 'partition', or 'tailscale' section — nothing to load.");
       return;
     }
 
-    const name = prompt("Save this upload as profile name:", "");
-    if (!name || !name.trim()) return;
-    const profileName = name.trim();
-
-    if (hasConfig) applyToForm(data.config);
-    if (hasPartition) {
-      ppTable = data.partition.table || "gpt";
-      $("pp_table").value = ppTable;
-      keepExisting = data.partition.keep_existing || 0;
-      $("pp_keep_existing").value = keepExisting;
-      partitions = data.partition.partitions;
-      selectedPart = 0;
-      renderAll();
+    if (hasConfig || hasPartition) {
+      const name = prompt("Save this upload as profile name:", "");
+      if (name && name.trim()) {
+        const profileName = name.trim();
+        if (hasConfig) applyToForm(data.config);
+        if (hasPartition) {
+          ppTable = data.partition.table || "gpt";
+          $("pp_table").value = ppTable;
+          keepExisting = data.partition.keep_existing || 0;
+          $("pp_keep_existing").value = keepExisting;
+          resizeLastKeptMib = data.partition.resize_last_kept_mib || null;
+          $("pp_resize_last_kept_mib").value = resizeLastKeptMib ?? "";
+          partitions = data.partition.partitions;
+          selectedPart = 0;
+          renderAll();
+        }
+        try {
+          const res = await (await fetch("/api/full-profiles", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              name: profileName,
+              config: hasConfig ? data.config : null,
+              partition: hasPartition ? { table: ppTable, keep_existing: keepExisting, resize_last_kept_mib: resizeLastKeptMib, partitions } : null,
+            }),
+          })).json();
+          if (res.error) throw new Error(res.error);
+          await refreshProfiles(profileName);
+        } catch (e) {
+          alert("Applied to the form, but saving profile '" + profileName + "' failed: " + e.message);
+        }
+      }
     }
 
-    try {
-      const res = await (await fetch("/api/full-profiles", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: profileName,
-          config: hasConfig ? data.config : null,
-          partition: hasPartition ? { table: ppTable, keep_existing: keepExisting, partitions } : null,
-        }),
-      })).json();
-      if (res.error) throw new Error(res.error);
-      await refreshProfiles(profileName);
-    } catch (e) {
-      alert("Applied to the form, but saving profile '" + profileName + "' failed: " + e.message);
+    // Tailscale settings are station-wide, not part of a profile — saved
+    // straight to /api/tailscale-config, independent of the profile-name
+    // prompt above.
+    if (hasTailscale) {
+      applyTailscaleConfig(data.tailscale);
+      try {
+        const res = await (await fetch("/api/tailscale-config", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(data.tailscale),
+        })).json();
+        if (res.error) throw new Error(res.error);
+      } catch (e) {
+        alert("Tailscale settings applied to the form, but saving failed: " + e.message);
+      }
     }
   });
 
@@ -1345,6 +1427,46 @@ all selected cards are written in parallel</footer>
     const original = btn.textContent;
     btn.textContent = "✓ Saved";
     setTimeout(() => { btn.textContent = original; }, 1600);
+  });
+
+  let errorDetailDevice = "";
+  function openErrorDetails(dev) {
+    const d = devices.find(x => x.device === dev);
+    const job = (d && d.job) || {};
+    errorDetailDevice = dev;
+    $("error_modal_device").textContent = dev;
+    $("error_modal_detail").textContent = job.detail || job.message || "(no details available)";
+    $("error_modal_server_log").style.display = "none";
+    $("error_modal_server_log").textContent = "";
+    $("error_modal_device_log").style.display = "none";
+    $("error_modal_device_log").textContent = "";
+    $("error_modal").style.display = "flex";
+  }
+  function closeErrorDetails() { $("error_modal").style.display = "none"; }
+  $("btn-error-close").addEventListener("click", closeErrorDetails);
+  $("error_modal").addEventListener("click", e => { if (e.target.id === "error_modal") closeErrorDetails(); });
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape" && $("error_modal").style.display !== "none") closeErrorDetails();
+  });
+  $("btn-load-server-log").addEventListener("click", async () => {
+    const box = $("error_modal_server_log");
+    box.style.display = "block"; box.textContent = "Loading…";
+    try {
+      const data = await (await fetch(`/api/logs-view?device=${encodeURIComponent(errorDetailDevice)}`)).json();
+      box.textContent = data.server_log || "(empty — server may not be running via the packaged launcher)";
+    } catch (e) {
+      box.textContent = "Couldn't load: " + e.message;
+    }
+  });
+  $("btn-load-device-log").addEventListener("click", async () => {
+    const box = $("error_modal_device_log");
+    box.style.display = "block"; box.textContent = "Loading…";
+    try {
+      const data = await (await fetch(`/api/logs-view?device=${encodeURIComponent(errorDetailDevice)}`)).json();
+      box.textContent = data.device_log || "(empty — no dd/verify log for this device)";
+    } catch (e) {
+      box.textContent = "Couldn't load: " + e.message;
+    }
   });
 
   function openTsLedger() {
