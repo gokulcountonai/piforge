@@ -39,11 +39,15 @@ python3 -c "import ast; [ast.parse(open(f).read(), filename=f) for f in ['server
 node -e "new Function(require('fs').readFileSync('index.html','utf8').match(/<script>([\s\S]*)<\/script>/)[1])"
 ```
 
-If your change touches actual flashing logic (`server.py`'s `flash_device`,
-`firstrun_gen.py`, the cancel/retry paths), please describe in the PR how
-you tested it against real hardware or at minimum a loop device — CI
-can't drive a card writer, so this is the one place manual verification
-still matters most.
+If your change touches actual flashing, partitioning, or Tailscale
+provisioning logic (`server.py`'s `flash_device`, `partition_device`,
+`resize_root_partition`, `install_tailscale_provisioning`, the cancel/retry
+paths, `firstrun_gen.py`), please describe in the PR how you tested it
+against real hardware or at minimum a loop device — CI can't drive a card
+writer, so this is the one place manual verification still matters most.
+A partition-resize change in particular should be verified with real data
+on the filesystem before and after (not just an empty one), since a bug
+there is a data-loss bug.
 
 ## Review process
 
